@@ -37,7 +37,7 @@ from distutils import sysconfig
 # TODO Move these into settings
 trace_filter = None
 time_filter = None
-
+collapse_filter = None
 
 def colourize_node(calls, total_time):
     value = float(total_time * 2 + calls) / 3
@@ -171,7 +171,11 @@ def is_module_stdlib(file_name):
     return file_name.lower().startswith(lib_path.lower())
 
 
-def start_trace(reset=True, filter_func=None, time_filter_func=None):
+def start_trace(
+    reset=True,
+    filter_func=None,
+    time_filter_func=None,
+    collapse_filter_func=None):
     """Begins a trace. Setting reset to True will reset all previously recorded
     trace data. filter_func needs to point to a callable function that accepts
     the parameters (call_stack, module_name, class_name, func_name, full_name).
@@ -181,6 +185,7 @@ def start_trace(reset=True, filter_func=None, time_filter_func=None):
     """
     global trace_filter
     global time_filter
+    global collapse_filter
     if reset:
         reset_trace()
 
@@ -193,6 +198,9 @@ def start_trace(reset=True, filter_func=None, time_filter_func=None):
         time_filter = time_filter_func
     else:
         time_filter = GlobbingFilter()
+
+    if collapse_filter_func:
+        collapse_filter = collapse_filter_func
 
     sys.settrace(tracer)
 
@@ -210,82 +218,87 @@ def tracer(frame, event, arg):
     global func_count
     global trace_filter
     global time_filter
+    global collapse_filter
     global call_stack
     global func_time
     global func_time_max
 
-    if event == 'call':
-        keep = True
-        code = frame.f_code
+    keep = True
+    collapse = False
+    code = frame.f_code
 
-        # Stores all the parts of a human readable name of the current call.
-        full_name_list = []
+    # Stores all the parts of a human readable name of the current call.
+    full_name_list = []
 
-        # Work out the module name
-        module = inspect.getmodule(code)
-        if module:
-            module_name = module.__name__
-            module_path = module.__file__
-            if not settings['include_stdlib'] \
-                and is_module_stdlib(module_path):
-                keep = False
-            if module_name == '__main__':
-                module_name = ''
-        else:
+    # Work out the module name
+    module = inspect.getmodule(code)
+    if module:
+        module_name = module.__name__
+        module_path = module.__file__
+        if not settings['include_stdlib'] \
+            and is_module_stdlib(module_path):
+            keep = False
+        if module_name == '__main__':
             module_name = ''
-        if module_name:
-            full_name_list.append(module_name)
+    else:
+        module_name = ''
+    if module_name:
+        full_name_list.append(module_name)
 
-        # Work out the class name.
-        try:
-            class_name = frame.f_locals['self'].__class__.__name__
-            full_name_list.append(class_name)
-        except (KeyError, AttributeError):
-            class_name = ''
+    # Work out the class name.
+    try:
+        class_name = frame.f_locals['self'].__class__.__name__
+        full_name_list.append(class_name)
+    except (KeyError, AttributeError):
+        class_name = ''
 
-        # Work out the current function or method
-        func_name = code.co_name
-        if func_name == '?':
-            func_name = '__main__'
-        full_name_list.append(func_name)
+    # Work out the current function or method
+    func_name = code.co_name
+    if func_name == '?':
+        func_name = '__main__'
+    full_name_list.append(func_name)
 
-        # Create a readable representation of the current call
-        full_name = '.'.join(full_name_list)
+    # Create a readable representation of the current call
+    full_name = '.'.join(full_name_list)
 
-        # Load the trace filter, if any. 'keep' determines if we should ignore
-        # this call
-        if keep and trace_filter:
-            keep = trace_filter(call_stack, module_name, class_name,
-                func_name, full_name)
+    # Load the trace filter, if any. 'keep' determines if we should ignore
+    # this call
+    if keep and trace_filter:
+        keep = trace_filter(call_stack, module_name, class_name,
+            func_name, full_name)
+    if collapse_filter:
+        collapse = collapse_filter(call_stack, module_name, class_name,
+            func_name, full_name)
 
+    if event == 'call':
         # Store the call information
         if keep:
+            if not collapse:
+                if call_stack:
+                    fr = call_stack[-1]
+                else:
+                    fr = None
+                if fr not in call_dict:
+                    call_dict[fr] = {}
+                if full_name not in call_dict[fr]:
+                    call_dict[fr][full_name] = 0
+                call_dict[fr][full_name] += 1
 
-            if call_stack:
-                fr = call_stack[-1]
-            else:
-                fr = None
-            if fr not in call_dict:
-                call_dict[fr] = {}
-            if full_name not in call_dict[fr]:
-                call_dict[fr][full_name] = 0
-            call_dict[fr][full_name] += 1
+                if full_name not in func_count:
+                    func_count[full_name] = 0
+                func_count[full_name] += 1
+                if func_count[full_name] > func_count_max:
+                    func_count_max = func_count[full_name]
 
-            if full_name not in func_count:
-                func_count[full_name] = 0
-            func_count[full_name] += 1
-            if func_count[full_name] > func_count_max:
-                func_count_max = func_count[full_name]
-
-            call_stack.append(full_name)
-            call_stack_timer.append(time.time())
+                call_stack.append(full_name)
+                call_stack_timer.append(time.time())
 
         else:
             call_stack.append('')
             call_stack_timer.append(None)
 
     if event == 'return':
-        if call_stack:
+        if call_stack and not collapse:
             full_name = call_stack.pop(-1)
             if call_stack_timer:
                 t = call_stack_timer.pop(-1)
